@@ -23,7 +23,7 @@ use dns_lru::DnsLru;
 use error::*;
 use hosts::Hosts;
 use lookup::{self, Lookup, LookupEither, LookupFuture};
-use lookup_ip::LookupIpFuture;
+use lookup_ip::PrepareAndLookupIpFuture;
 use lookup_state::CachingClient;
 use name_server_pool::{NameServerPool, StandardConnection};
 
@@ -222,8 +222,8 @@ impl ResolverFuture {
     ///
     /// # Arguments
     /// * `host` - string hostname, if this is an invalid hostname, an error will be returned.
-    pub fn lookup_ip<N: IntoName + TryParseIp>(&self, host: N) -> LookupIpFuture<N> {
-        LookupIpFuture::new(
+    pub fn lookup_ip<N: IntoName + TryParseIp>(&self, host: N) -> PrepareAndLookupIpFuture<N> {
+        PrepareAndLookupIpFuture::new(
             host,
             self.config.clone(),
             self.options.clone(),
