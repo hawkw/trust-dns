@@ -18,16 +18,19 @@ use std::time::Instant;
 use futures::{future, task, Async, Future, Poll};
 
 use trust_dns_proto::op::Query;
-use trust_dns_proto::rr::{Name, RData, RecordType};
+use trust_dns_proto::rr::{
+    domain::TryParseIp,
+    IntoName, Name, RData, RecordType,
+};
 use trust_dns_proto::xfer::{DnsHandle, DnsRequestOptions};
 
-use config::LookupIpStrategy;
+use config::{ResolverConfig, ResolverOpts, LookupIpStrategy};
 use error::*;
 use hosts::Hosts;
 use lookup::{Lookup, LookupEither, LookupIter};
 use lookup_state::CachingClient;
 use name_server_pool::StandardConnection;
-use resolver_future::BasicResolverHandle;
+use resolver_future::{self, BasicResolverHandle};
 
 /// Result of a DNS query when querying for A or AAAA records.
 ///
@@ -72,20 +75,157 @@ impl<'i> Iterator for LookupIpIter<'i> {
 /// The Future returned from ResolverFuture when performing an A or AAAA lookup.
 ///
 /// This type isn't necessarily something that should be used by users, see the default TypeParameters are generally correct
-pub struct LookupIpFuture<C = LookupEither<BasicResolverHandle, StandardConnection>>
+pub struct LookupIpFuture<N, C = LookupEither<BasicResolverHandle, StandardConnection>>
 where
     C: DnsHandle<Error = ResolveError> + 'static,
+    N: IntoName + TryParseIp,
 {
+    state: State<N, C>,
+}
+
+enum State<N, C>
+where
+    C: DnsHandle<Error = ResolveError> + 'static,
+    N: IntoName + TryParseIp,
+{
+    Preparing(Option<Preparing<C, N>>),
+    Querying(Querying<C>),
+}
+
+struct Preparing<C: DnsHandle<Error = ResolveError> + 'static, N> {
+    config: ResolverConfig,
+    options: ResolverOpts,
+    client_cache: CachingClient<C>,
+    host: N,
+    hosts: Option<Arc<Hosts>>,
+}
+
+struct Querying<C: DnsHandle<Error = ResolveError> + 'static> {
     client_cache: CachingClient<C>,
     names: Vec<Name>,
     strategy: LookupIpStrategy,
     options: DnsRequestOptions,
-    future: Box<Future<Item = Lookup, Error = ResolveError> + Send>,
+    query: Box<Future<Item = Lookup, Error = ResolveError> + Send>,
     hosts: Option<Arc<Hosts>>,
     finally_ip_addr: Option<RData>,
 }
 
-impl<C: DnsHandle<Error = ResolveError> + 'static> LookupIpFuture<C> {
+impl<C: DnsHandle<Error = ResolveError> + 'static> Future for Querying<C> {
+    type Item = Lookup;
+    type Error = ResolveError;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            let query = self.query.poll();
+            if let Ok(Async::NotReady) = query {
+                return Ok(Async::NotReady);
+            }
+
+            let non_empty = if let Ok(Async::Ready(ref lookup)) = query {
+                !lookup.is_empty()
+            } else {
+                false
+            };
+
+            if non_empty {
+                return query;
+            }
+
+            if let Some(name) = self.names.pop() {
+                self.query = strategic_lookup(
+                    name,
+                    self.strategy,
+                    self.client_cache.clone(),
+                    self.options.clone(),
+                    self.hosts.clone(),
+                );
+            } else if let Some(ip_addr) = self.finally_ip_addr.take() {
+                return Ok(Async::Ready(
+                    Lookup::new_with_max_ttl(Arc::new(vec![ip_addr])).into(),
+                ));
+            } else {
+                return query;
+            }
+        }
+    }
+}
+
+impl<N, C> Future for LookupIpFuture<N, C>
+where
+    C: DnsHandle<Error = ResolveError> + 'static,
+    N: IntoName + TryParseIp,
+{
+    type Item = LookupIp;
+    type Error = ResolveError;
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        loop {
+            if let State::Querying(ref mut querying) = self.state {
+                return querying.poll()
+                    .map(|async| async.map(LookupIp::from));
+            };
+
+            self.state = if let State::Preparing(ref mut preparing) = self.state {
+                let Preparing {
+                    config,
+                    options,
+                    client_cache,
+                    host,
+                    hosts,
+                } = preparing.take().expect("Preparing should not be taken twice");
+                let mut finally_ip_addr = None;
+
+                // if host is a ip address, return directly.
+                if let Some(ip_addr) = host.try_parse_ip() {
+                    // if ndots are greater than 4, then we can't assume the name is an IpAddr
+                    //   this accepts IPv6 as well, b/c IPv6 can take the form: 2001:db8::198.51.100.35
+                    //   but `:` is not a valid DNS character, so techinically this will fail parsing.
+                    //   TODO: should we always do search before returning this?
+                    if options.ndots > 4 {
+                        finally_ip_addr = Some(ip_addr);
+                    } else {
+                        let lookup = Lookup::new_with_max_ttl(Arc::new(vec![ip_addr]));
+                        return Ok(Async::Ready(LookupIp::from(lookup)))
+                    }
+                }
+
+                let name = match (host.into_name(), finally_ip_addr.as_ref()) {
+                    (Ok(name), _) => name,
+                    (Err(_), Some(ip_addr)) => {
+                        // it was a valid IP, return that...
+                        let lookup = Lookup::new_with_max_ttl(Arc::new(vec![ip_addr.clone()]));
+                        return Ok(Async::Ready(LookupIp::from(lookup)));
+                    }
+                    (Err(err), None) => {
+                        return Err(ResolveError::from(err));
+                    }
+                };
+
+                let names = resolver_future::build_names(&config, options.ndots, name);
+                let empty = ResolveError::from(ResolveErrorKind::Message("can not lookup IPs for no names"));
+                State::Querying(Querying {
+                    client_cache,
+                    names,
+                    // If there are no names remaining, this will be returned immediately.
+                    query: Box::new(future::err(empty)),
+                    strategy: options.ip_strategy,
+                    options: DnsRequestOptions::default(),
+                    hosts,
+                    finally_ip_addr,
+                })
+
+            } else {
+                unreachable!()
+            }
+        }
+    }
+}
+
+
+impl<C, N> LookupIpFuture<N, C>
+where
+    C: DnsHandle<Error = ResolveError> + 'static,
+    N: IntoName + TryParseIp,
+{
     /// Perform a lookup from a hostname to a set of IPs
     ///
     /// # Arguments
@@ -93,110 +233,23 @@ impl<C: DnsHandle<Error = ResolveError> + 'static> LookupIpFuture<C> {
     /// * `names` - a set of DNS names to attempt to resolve, they will be attempted in queue order, i.e. the first is `names.pop()`. Upon each failure, the next will be attempted.
     /// * `strategy` - the lookup IP strategy to use
     /// * `client_cache` - cache with a connection to use for performing all lookups
-    pub fn lookup(
-        mut names: Vec<Name>,
-        strategy: LookupIpStrategy,
+    pub fn new(
+        host: N,
+        config: ResolverConfig,
+        options: ResolverOpts,
         client_cache: CachingClient<C>,
-        options: DnsRequestOptions,
         hosts: Option<Arc<Hosts>>,
-        finally_ip_addr: Option<RData>,
     ) -> Self {
-        let name = names.pop().ok_or_else(|| {
-            ResolveError::from(ResolveErrorKind::Message("can not lookup IPs for no names"))
-        });
-
-        let query: Box<Future<Item = Lookup, Error = ResolveError> + Send> = match name {
-            Ok(name) => strategic_lookup(
-                name,
-                strategy,
-                client_cache.clone(),
-                options.clone(),
-                hosts.clone(),
-            ),
-            Err(err) => Box::new(future::err(err)),
-        };
-
         LookupIpFuture {
-            client_cache: client_cache,
-            names,
-            strategy,
-            options,
-            future: query,
-            hosts: hosts,
-            finally_ip_addr,
-        }
-    }
-
-    fn next_lookup<F: FnOnce() -> Poll<LookupIp, ResolveError>>(
-        &mut self,
-        otherwise: F,
-    ) -> Poll<LookupIp, ResolveError> {
-        let name = self.names.pop();
-        if let Some(name) = name {
-            let query = strategic_lookup(
-                name,
-                self.strategy,
-                self.client_cache.clone(),
-                self.options.clone(),
-                self.hosts.clone(),
-            );
-
-            mem::replace(&mut self.future, Box::new(query));
-            // guarantee that we get scheduled for the next turn...
-            task::current().notify();
-            Ok(Async::NotReady)
-        } else if let Some(ip_addr) = mem::replace(&mut self.finally_ip_addr, None) {
-            Ok(Async::Ready(
-                Lookup::new_with_max_ttl(Arc::new(vec![ip_addr])).into(),
+            state: State::Preparing(Some(
+                Preparing {
+                    host,
+                    config,
+                    options,
+                    client_cache,
+                    hosts,
+                }
             ))
-        } else {
-            otherwise()
-        }
-    }
-
-    pub(crate) fn error<E: Error>(client_cache: CachingClient<C>, error: E) -> Self {
-        return LookupIpFuture {
-            // errors on names don't need to be cheap... i.e. this clone is unfortunate in this case.
-            client_cache,
-            names: vec![],
-            strategy: LookupIpStrategy::default(),
-            options: DnsRequestOptions::default(),
-            future: Box::new(future::err(
-                ResolveErrorKind::Msg(format!("{}", error)).into(),
-            )),
-            hosts: None,
-            finally_ip_addr: None,
-        };
-    }
-
-    pub(crate) fn ok(client_cache: CachingClient<C>, lp: Lookup) -> Self {
-        return LookupIpFuture {
-            client_cache,
-            names: vec![],
-            strategy: LookupIpStrategy::default(),
-            options: DnsRequestOptions::default(),
-            future: Box::new(future::ok(lp)),
-            hosts: None,
-            finally_ip_addr: None,
-        };
-    }
-}
-
-impl<C: DnsHandle<Error = ResolveError> + 'static> Future for LookupIpFuture<C> {
-    type Item = LookupIp;
-    type Error = ResolveError;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.future.poll() {
-            Ok(Async::Ready(lookup)) => if lookup.is_empty() {
-                return self.next_lookup(|| Ok(Async::Ready(LookupIp::from(lookup))));
-            } else {
-                return Ok(Async::Ready(LookupIp::from(lookup)));
-            },
-            Ok(Async::NotReady) => Ok(Async::NotReady),
-            Err(e) => {
-                return self.next_lookup(|| Err(e));
-            }
         }
     }
 }
