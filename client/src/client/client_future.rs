@@ -13,7 +13,6 @@ use std::time::Duration;
 use futures::stream::Stream;
 use futures::{future, Future, Poll};
 use rand;
-use tokio;
 use trust_dns_proto::error::ProtoError;
 use trust_dns_proto::xfer::{
     BufDnsRequestStreamHandle, DnsClientStream, DnsExchange, DnsHandle, DnsMultiplexer,
@@ -39,20 +38,34 @@ pub struct ClientFuture<S: Stream<Item = SerialMessage, Error = io::Error>> {
     phantom: PhantomData<S>,
 }
 
+/// A background future that drives a `ClientFuture`.
+///
+/// This must be spawned on an executor before the associated `ClientFuture`
+/// will yield results.
+pub type ClientBackground = Box<Future<Item = (), Error = ()> + Send>;
+
 impl<S: DnsClientStream + 'static> ClientFuture<S> {
-    /// Spawns a new ClientFuture Stream. This uses a default timeout of 5 seconds for all requests.
+    /// Returns a new ClientFuture Stream. This uses a default timeout of 5 seconds for all
+    /// requests.
     ///
     /// # Arguments
     ///
     /// * `stream` - A stream of bytes that can be used to send/receive DNS messages
     ///              (see TcpClientStream or UdpClientStream)
     /// * `stream_handle` - The handle for the `stream` on which bytes can be sent/received.
-    /// * `signer` - An optional signer for requests, needed for Updates with Sig0, otherwise not needed
+    /// * `signer` - An optional signer for requests, needed for Updates with Sig0, otherwise not
+    ///              needed.
+    ///
+    /// # Returns
+    ///
+    /// A `Future` whose item is a tuple of `(BasicClientHandle, ClientBackground)`. Futures
+    /// returned by the `BasicClientHandle` will not finish until the `ClientBackground` future
+    /// has been spawned on an executor.
     pub fn new(
         stream: Box<Future<Item = S, Error = io::Error> + Send>,
         stream_handle: Box<DnsStreamHandle>,
         signer: Option<Arc<Signer>>,
-    ) -> Box<Future<Item = BasicClientHandle, Error = ClientError> + Send> {
+    ) -> Box<Future<Item = (BasicClientHandle, ClientBackground), Error = ClientError> + Send> {
         Self::with_timeout(stream, stream_handle, Duration::from_secs(5), signer)
     }
 
@@ -71,20 +84,21 @@ impl<S: DnsClientStream + 'static> ClientFuture<S> {
         stream_handle: Box<DnsStreamHandle>,
         timeout_duration: Duration,
         finalizer: Option<Arc<Signer>>,
-    ) -> Box<Future<Item = BasicClientHandle, Error = ClientError> + Send> {
+    ) -> Box<Future<Item = (BasicClientHandle, ClientBackground), Error = ClientError> + Send> {
         Box::new(future::lazy(move || {
             let dns_conn =
                 DnsMultiplexer::with_timeout(stream, stream_handle, timeout_duration, finalizer);
 
             let (stream, handle) = DnsExchange::connect(dns_conn);
-            // TODO: instead of spawning here, return the stream as a "Background" type...
-            tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                error!("error, connection shutting down: {}", e);
-            }));
-
-            future::ok(BasicClientHandle {
+            let bg = stream
+                .and_then((|stream| stream) as fn(DnsExchange<_, _>) -> _)
+                .map_err((|e| {
+                    error!("error, connection shutting down: {}", e);
+                }) as fn(ProtoError) -> ());
+            let handle = BasicClientHandle {
                 message_sender: BufDnsRequestStreamHandle::new(handle),
-            })
+            };
+            future::ok((handle, bg))
         }))
     }
 }

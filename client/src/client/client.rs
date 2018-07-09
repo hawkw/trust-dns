@@ -21,7 +21,7 @@ use trust_dns_proto::xfer::DnsResponse;
 
 #[cfg(any(feature = "openssl", feature = "ring"))]
 use client::SecureClientHandle;
-use client::{BasicClientHandle, ClientConnection, ClientFuture, ClientHandle};
+use client::{BasicClientHandle, ClientConnection, ClientFuture, ClientBackground, ClientHandle};
 use error::*;
 use rr::dnssec::Signer;
 #[cfg(any(feature = "openssl", feature = "ring"))]
@@ -408,7 +408,10 @@ where
 {
     fn new_future(
         &self,
-    ) -> ClientResult<Box<Future<Item = BasicClientHandle, Error = ClientError> + Send>> {
+    ) -> ClientResult<Box<Future<
+        Item = (BasicClientHandle, ClientBackground),
+        Error = ClientError
+    > + Send>> {
         let (stream, stream_handle) = self.conn.new_stream()?;
 
         let client = ClientFuture::new(stream, stream_handle, self.signer.clone());
