@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use futures::future::Loop;
-use futures::{future, task, stream, sync::mpsc, Async, Future, IntoFuture, Poll, Stream};
+use futures::{future, task, sync::mpsc, Async, Future, IntoFuture, Poll, Stream};
 
 #[cfg(feature = "dns-over-https")]
 use trust_dns_https;
@@ -646,9 +646,10 @@ impl<C: DnsHandle + 'static, P: ConnectionProvider<ConnHandle = C> + 'static> Na
             })
             .unzip();
 
-        let bgs = datagram_bgs.into_iter().chain(stream_bgs.into_iter());
-        let bg = stream::futures_unordered(bgs)
-            .fold((), |(), ()| future::ok(()));
+        let bg = future::join_all(
+            datagram_bgs.into_iter()
+                .chain(stream_bgs.into_iter())
+            ).map(|_| ());
 
         let pool = NameServerPool {
             datagram_conns: Arc::new(Mutex::new(datagram_conns)),
