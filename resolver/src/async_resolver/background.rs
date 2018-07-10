@@ -33,7 +33,7 @@ pub(super) fn task(
     request_rx: mpsc::UnboundedReceiver<Request>,
 ) -> impl Future<Item = (), Error = ()> {
     future::lazy(move || {
-        let pool =
+        let (pool, pool_bg) =
             NameServerPool::<ConnectionHandle, StandardConnection>::from_config(&config, &options);
         let either;
         let client = RetryDnsHandle::new(pool.clone(), options.attempts);
@@ -59,13 +59,14 @@ pub(super) fn task(
             None
         };
 
-        Task {
+        let task = Task {
             config,
             options,
             client_cache: CachingClient::with_cache(lru, either),
             hosts: hosts,
             request_rx,
-        }
+        };
+        task.join(pool_bg).map(|((), ())| ())
     })
 }
 

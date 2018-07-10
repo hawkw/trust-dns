@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 use std::time::Instant;
 
 use futures::future::Loop;
-use futures::{future, task, Async, Future, IntoFuture, Poll};
+use futures::{future, task, stream, sync::mpsc, Async, Future, IntoFuture, Poll, Stream};
 
 #[cfg(feature = "dns-over-https")]
 use trust_dns_https;
@@ -187,7 +187,7 @@ impl PartialOrd for NameServerStats {
 #[doc(hidden)]
 pub trait ConnectionProvider: 'static + Clone + Send + Sync {
     type ConnHandle;
-    type Background: Future<Item=(), Error=()>;
+    type Background: Future<Item=(), Error=()> + Send;
 
     fn new_connection(config: &NameServerConfig, options: &ResolverOpts)
         -> (Self::ConnHandle, Self::Background);
@@ -358,47 +358,61 @@ impl Future for ConnectionHandleResponse {
 }
 
 /// Specifies the details of a remote NameServer used for lookups
-#[derive(Clone)]
 pub struct NameServer<C: DnsHandle, P: ConnectionProvider<ConnHandle = C>> {
     config: NameServerConfig,
     options: ResolverOpts,
     client: C,
     // TODO: switch to FuturesMutex? (Mutex will have some undesireable locking)
+    reconnect_tx: mpsc::UnboundedSender<P::Background>,
     stats: Arc<Mutex<NameServerStats>>,
     phantom: PhantomData<P>,
 }
 
-impl<C: DnsHandle, P: ConnectionProvider<ConnHandle = C>> NameServer<C, P> {
+
+impl NameServer<ConnectionHandle, StandardConnection> {
     pub fn new(
         config: NameServerConfig,
         options: ResolverOpts,
-    ) -> NameServer<ConnectionHandle, StandardConnection> {
-        let client = StandardConnection::new_connection(&config, &options);
+    ) -> (
+        NameServer<ConnectionHandle, StandardConnection>,
+        ReconnectTask<<StandardConnection as ConnectionProvider>::Background>
+    ) {
+        let (client, client_bg) = StandardConnection::new_connection(&config, &options);
+        let (reconnect_tx, bg) = ReconnectTask::new(client_bg);
 
         // TODO: setup EDNS
-        NameServer {
+        let name_server = NameServer {
             config,
             options,
             client,
+            reconnect_tx,
             stats: Arc::new(Mutex::new(NameServerStats::default())),
             phantom: PhantomData,
-        }
+        };
+        (name_server, bg)
     }
 
-    #[doc(hidden)]
-    pub fn from_conn(
-        config: NameServerConfig,
-        options: ResolverOpts,
-        client: C,
-    ) -> NameServer<C, P> {
-        NameServer {
-            config,
-            options,
-            client,
-            stats: Arc::new(Mutex::new(NameServerStats::default())),
-            phantom: PhantomData,
-        }
-    }
+}
+impl<C, P> NameServer<C, P>
+where
+    C: DnsHandle,
+    P: ConnectionProvider<ConnHandle = C>,
+{
+
+    // #[doc(hidden)]
+    // pub fn from_conn(
+    //     config: NameServerConfig,
+    //     options: ResolverOpts,
+    //     client: C,
+    // ) -> NameServer<C, P> {
+    //     NameServer {
+    //         config,
+    //         options,
+    //         client,
+    //         stats: Arc::new(Mutex::new(NameServerStats::default())),
+    //         phantom: PhantomData,
+    //     }
+    // }
 
     /// checks if the connection is failed, if so then reconnect.
     fn try_reconnect(&mut self) -> ProtoResult<()> {
@@ -418,14 +432,13 @@ impl<C: DnsHandle, P: ConnectionProvider<ConnHandle = C>> NameServer<C, P> {
         if let Some((successes, failures)) = error_opt {
             debug!("reconnecting: {:?}", self.config);
             // establish a new connection
-            let client = P::new_connection(&self.config, &self.options);
-            mem::replace(&mut self.client, client);
+            let (client, client_bg) = P::new_connection(&self.config, &self.options);
+            self.reconnect_tx.unbounded_send(client_bg)
+                .map_err(|_| ProtoError::from("reconnect task is dead!"))?;
+            self.client = client;
 
             // reinitialize the mutex (in case it was poisoned before)
-            mem::replace(
-                &mut self.stats,
-                Arc::new(Mutex::new(NameServerStats::init(None, successes, failures))),
-            );
+            self.stats = Arc::new(Mutex::new(NameServerStats::init(None, successes, failures)));
             Ok(())
         } else {
             Ok(())
@@ -543,6 +556,59 @@ fn mdns_nameserver(options: ResolverOpts) -> NameServer<ConnectionHandle, Standa
     NameServer::<_, StandardConnection>::new(config, options)
 }
 
+#[derive(Debug)]
+pub struct ReconnectTask<F> {
+    current: F,
+    rx: mpsc::UnboundedReceiver<F>,
+}
+
+// We have to implement this manually, because the derived impl requires
+// that `P::Background` be `Clone` even though it is not really part
+// of this struct.
+impl<C, P> Clone for NameServer<C, P>
+where
+    C: DnsHandle + Clone,
+    P: ConnectionProvider<ConnHandle = C>,
+{
+    fn clone(&self) -> Self {
+        NameServer {
+            config:  self.config.clone(),
+            options: self.options,
+            client: self.client.clone(),
+            stats: self.stats.clone(),
+            reconnect_tx: self.reconnect_tx.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<F: Future> ReconnectTask<F> {
+    fn new(current: F) -> (mpsc::UnboundedSender<F>, Self) {
+        let (tx, rx) = mpsc::unbounded();
+        let task = ReconnectTask {
+            current,
+            rx
+        };
+        (tx, task)
+    }
+}
+
+impl<F: Future> Future for ReconnectTask<F> {
+    type Item = F::Item;
+    type Error = F::Error;
+
+    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+        // First, try to poll the receiver to see if the currently
+        // running future is being replaced.
+        if let Ok(Async::Ready(Some(new_future))) = self.rx.poll() {
+            self.current = new_future;
+        };
+        // Then, poll the currently-running future.
+        self.current.poll()
+    }
+}
+
+
 /// A pool of NameServers
 ///
 /// This is not expected to be used directly, see `ResolverFuture`.
@@ -561,33 +627,38 @@ impl<C: DnsHandle + 'static, P: ConnectionProvider<ConnHandle = C> + 'static> Na
     pub(crate) fn from_config(
         config: &ResolverConfig,
         options: &ResolverOpts,
-    ) -> NameServerPool<ConnectionHandle, StandardConnection> {
-        let datagram_conns: Vec<NameServer<ConnectionHandle, StandardConnection>> = config
+    ) -> (NameServerPool<ConnectionHandle, StandardConnection>, impl Future<Item=(), Error=()>+Send) {
+        let (datagram_conns, datagram_bgs): (Vec<NameServer<_, _>>, Vec<_>) = config
             .name_servers()
             .iter()
             .filter(|ns_config| ns_config.protocol.is_datagram())
             .map(|ns_config| {
                 NameServer::<_, StandardConnection>::new(ns_config.clone(), options.clone())
             })
-            .collect();
+            .unzip();
 
-        let stream_conns: Vec<NameServer<ConnectionHandle, StandardConnection>> = config
+        let (stream_conns, stream_bgs): (Vec<NameServer<_, _>>, Vec<_>) = config
             .name_servers()
             .iter()
             .filter(|ns_config| ns_config.protocol.is_stream())
             .map(|ns_config| {
                 NameServer::<_, StandardConnection>::new(ns_config.clone(), options.clone())
             })
-            .collect();
+            .unzip();
 
-        NameServerPool {
+        let bgs = datagram_bgs.into_iter().chain(stream_bgs.into_iter());
+        let bg = stream::futures_unordered(bgs)
+            .fold((), |(), ()| future::ok(()));
+
+        let pool = NameServerPool {
             datagram_conns: Arc::new(Mutex::new(datagram_conns)),
             stream_conns: Arc::new(Mutex::new(stream_conns)),
             #[cfg(feature = "mdns")]
             mdns_conns: mdns_nameserver(options.clone()),
             options: options.clone(),
             phantom: PhantomData,
-        }
+        };
+        (pool, bg)
     }
 
     #[doc(hidden)]
@@ -634,6 +705,7 @@ impl<C, P> DnsHandle for NameServerPool<C, P>
 where
     C: DnsHandle + 'static,
     P: ConnectionProvider<ConnHandle = C> + 'static,
+    P::Background: Send,
 {
     type Response = Box<Future<Item = DnsResponse, Error = ProtoError> + Send>;
 
