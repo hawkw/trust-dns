@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use futures::future::Loop;
 use futures::{future, task, Async, Future, IntoFuture, Poll};
-use tokio;
 
 #[cfg(feature = "dns-over-https")]
 use trust_dns_https;
@@ -188,8 +187,10 @@ impl PartialOrd for NameServerStats {
 #[doc(hidden)]
 pub trait ConnectionProvider: 'static + Clone + Send + Sync {
     type ConnHandle;
+    type Background: Future<Item=(), Error=()>;
 
-    fn new_connection(config: &NameServerConfig, options: &ResolverOpts) -> Self::ConnHandle;
+    fn new_connection(config: &NameServerConfig, options: &ResolverOpts)
+        -> (Self::ConnHandle, Self::Background);
 }
 
 /// Standard connection implements the default mechanism for creating new Connections
@@ -198,9 +199,12 @@ pub struct StandardConnection;
 
 impl ConnectionProvider for StandardConnection {
     type ConnHandle = ConnectionHandle;
+    // TODO: It would be nice if this didn't have to be boxed....
+    type Background = Box<dyn Future<Item = (), Error = ()> + Send>;
 
-    fn new_connection(config: &NameServerConfig, options: &ResolverOpts) -> Self::ConnHandle {
-        let dns_handle = match config.protocol {
+    fn new_connection(config: &NameServerConfig, options: &ResolverOpts)
+        -> (Self::ConnHandle, Self::Background) {
+        match config.protocol {
             Protocol::Udp => {
                 let (stream, handle) = UdpClientStream::new(config.socket_addr);
                 // TODO: need config for Signer...
@@ -212,13 +216,14 @@ impl ConnectionProvider for StandardConnection {
                 );
 
                 let (stream, handle) = DnsExchange::connect(dns_conn);
-                // TODO: instead of spawning here, return the stream as a "Background" type...
-                tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                    error!("error, udp connection shutting down: {}", e);
-                }));
+                let bg = stream
+                   .and_then(|stream| stream)
+                   .map_err(|e| {
+                        error!("error, udp connection shutting down: {}", e);
+                    });
 
                 let handle = BufDnsRequestStreamHandle::new(handle);
-                ConnectionHandle::UdpOrTcp(handle)
+                (ConnectionHandle::UdpOrTcp(handle), Box::new(bg))
             }
             Protocol::Tcp => {
                 let (stream, handle) =
@@ -232,12 +237,14 @@ impl ConnectionProvider for StandardConnection {
                 );
 
                 let (stream, handle) = DnsExchange::connect(dns_conn);
-                tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                    error!("error, tcp connection shutting down: {}", e);
-                }));
+                let bg = stream
+                   .and_then(|stream| stream)
+                   .map_err(|e| {
+                        error!("error, tcp connection shutting down: {}", e);
+                    });
 
                 let handle = BufDnsRequestStreamHandle::new(handle);
-                ConnectionHandle::UdpOrTcp(handle)
+                (ConnectionHandle::UdpOrTcp(handle), Box::new(bg))
             }
             #[cfg(feature = "dns-over-tls")]
             Protocol::Tls => {
@@ -253,12 +260,14 @@ impl ConnectionProvider for StandardConnection {
                 );
 
                 let (stream, handle) = DnsExchange::connect(dns_conn);
-                tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                    error!("error, tcp connection shutting down: {}", e);
-                }));
+                let bg = stream
+                   .and_then(|stream| stream)
+                   .map_err(|e| {
+                        error!("error, tcp connection shutting down: {}", e);
+                    });
 
                 let handle = BufDnsRequestStreamHandle::new(handle);
-                ConnectionHandle::UdpOrTcp(handle)
+                (ConnectionHandle::UdpOrTcp(handle), Box::new(bg))
             }
             #[cfg(feature = "dns-over-https")]
             Protocol::Https => {
@@ -267,11 +276,13 @@ impl ConnectionProvider for StandardConnection {
                     config.tls_dns_name.clone().unwrap_or_default(),
                 );
 
-                tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                    error!("error, https connection shutting down: {}", e);
-                }));
+                let bg = stream
+                   .and_then(|stream| stream)
+                   .map_err(|e| {
+                        error!("error, https connection shutting down: {}", e);
+                    });
 
-                ConnectionHandle::Https(handle)
+                (ConnectionHandle::Https(handle), Box::new(bg))
             }
             #[cfg(feature = "mdns")]
             Protocol::Mdns => {
@@ -291,16 +302,16 @@ impl ConnectionProvider for StandardConnection {
                 );
 
                 let (stream, handle) = DnsExchange::connect(dns_conn);
-                tokio::executor::spawn(stream.and_then(|stream| stream).map_err(|e| {
-                    error!("error, udp connection shutting down: {}", e);
-                }));
+                let bg = stream
+                   .and_then(|stream| stream)
+                   .map_err(|e| {
+                        error!("error, udp connection shutting down: {}", e);
+                    });
 
                 let handle = BufDnsRequestStreamHandle::new(handle);
-                ConnectionHandle::UdpOrTcp(handle)
+                (ConnectionHandle::UdpOrTcp(handle), Box::new(bg))
             }
-        };
-
-        dns_handle
+        }
     }
 }
 
